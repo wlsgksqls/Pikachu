@@ -49,7 +49,7 @@
 <body>
   <div id="stage">
     <canvas id="game" width="432" height="304"></canvas>
-    <div id="hint">1P: A/D · W · SPACE &nbsp;|&nbsp; 2P: ←/→ · ↑ · ENTER &nbsp;|&nbsp; P: pause · M: mute</div>
+    <div id="hint">1P: A/D · W · Z/SPACE &nbsp;|&nbsp; 2P: ←/→ · ↑ · ENTER &nbsp;|&nbsp; P: pause · M: mute</div>
   </div>
 
 <script>
@@ -72,19 +72,34 @@
   const PLAYER_HALF_W = 19;
   const PLAYER_HALF_H = 20;
   const GROUND_PLAYER_Y = FLOOR_Y - PLAYER_HALF_H;   // body-centre Y when standing
-  const BODY_R = 18;            // Pikachu collision radius (head+body blob)
+  const BODY_R = 20;            // Pikachu collision radius (head+body blob)
 
   const BALL_R = 12;
   const BALL_GROUND_Y = FLOOR_Y - BALL_R;
 
-  const GRAVITY_BALL   = 0.40;
+  // --- ball flight: asymmetric gravity gives the original's "hang then drop" arc ---
+  const GRAVITY_UP     = 0.30;    // gentle while rising  -> floaty hang time at the apex
+  const GRAVITY_DOWN   = 0.55;    // stronger while falling -> quick, snappy descent
+  const BALL_FALL_MAX  = 17;      // terminal fall speed (sub-stepping prevents tunnelling)
+  const AIR_DRAG       = 0.999;   // featherweight horizontal air resistance
   const GRAVITY_PLAYER = 0.62;
   const JUMP_V         = -12.6;
   const MOVE_SPEED     = 4.3;
-  const BALL_MAX       = 16;
-  const SPIKE_SPEED    = 15;
+  const BALL_MAX       = 20;      // clamp for ordinary bumps (spikes are allowed to exceed)
   const DIVE_SPEED     = 8;
-  const DIVE_RECOVER   = 20;    // frames lying down after a slide
+  const DIVE_RECOVER   = 20;      // frames lying down after a slide
+
+  // --- hard-coded collision response (this is where the "손맛" lives) ---
+  const HEAD_SPREAD    = 0.42;    // outgoing vx per px of horizontal offset from Pikachu's centre
+  const BUMP_UP        = 10.0;    // upward pop on a clean head/body bump (crown hit = highest)
+  const BUMP_FORWARD   = 1.8;     // Pikachu always faces the net, so bumps carry slightly forward
+  const FEET_DY        = 4;       // ball-below-centre threshold counting as a feet/leg block
+  const SLIDE_UP       = 15;      // fixed upward set-up vector for a sliding receive
+  const SPIKE_VX       = 17, SPIKE_VY      = 10;   // standard diagonal slam
+  const SPIKE_DOWN_VX  = 11, SPIKE_DOWN_VY = 17;   // steep kill        (hold DOWN)
+  const SPIKE_FLAT_VX  = 20, SPIKE_FLAT_VY = 4;    // flat fast drive   (hold UP)
+  const DRIVE_VX       = 14, DRIVE_VY      = -2;   // grounded power hit = flat forward drive
+  const NET_ROLL_V     = 3.0;     // |vx| below which a ball perches on the cord and rolls off
 
   const POINTS_PER_SET = 15;
   const SETS_TO_WIN    = 2;     // best of 3
@@ -197,7 +212,7 @@
       right: !!keys['KeyD'],
       up:    !!keys['KeyW'],
       down:  !!keys['KeyS'],
-      power: !!keys['Space'] || !!keys['ShiftLeft']
+      power: !!keys['KeyZ'] || !!keys['Space'] || !!keys['ShiftLeft']
     };
   }
 
@@ -338,14 +353,20 @@
   }
 
   // =========================================================================
-  //  BALL <-> PLAYER COLLISION  (the heart of the physics)
-  //  The contact normal decides the rebound angle, so a hit on the HEAD
-  //  pops the ball up, a hit on the BODY/front drives it sideways, and a
-  //  hit on the BACK/TAIL flicks it back over the player like a set.
+  //  BALL <-> PLAYER COLLISION  (the heart of the "feel")
+  //  Hard-coded, original-style responses instead of plain elastic reflection:
+  //   - head/body : outgoing angle is set by WHERE on Pikachu it hit (the
+  //                 horizontal offset from centre). Crown -> straight up high;
+  //                 front of the head -> forward and flat ("전진성").
+  //   - feet/legs : a low ball met by a grounded Pikachu just dribbles down.
+  //   - spike     : a fixed, enormous diagonal-down vector that completely
+  //                 ignores the ball's incoming velocity.
+  //   - slide     : a fixed, tall, near-vertical set-up vector.
   // =========================================================================
-  function clampBallSpeed() {
+  function clampBallSpeed(maxSpeed) {
+    const m = maxSpeed || BALL_MAX;
     const s = Math.hypot(ball.vx, ball.vy);
-    if (s > BALL_MAX) { ball.vx = ball.vx / s * BALL_MAX; ball.vy = ball.vy / s * BALL_MAX; }
+    if (s > m) { ball.vx = ball.vx / s * m; ball.vy = ball.vy / s * m; }
   }
 
   // After a hit repositions the ball, keep it inside the walls and on the
@@ -358,98 +379,106 @@
     }
   }
 
-  function spike(p) {
-    const f = p.facing;
-    const up = p.in.up, down = p.in.down;
-    if (down) {                       // steep kill straight down
-      ball.vx = f * SPIKE_SPEED * 0.85;
-      ball.vy = SPIKE_SPEED * 0.85;
-    } else if (up) {                  // high deep lob / feint
-      ball.vx = f * SPIKE_SPEED * 0.5;
-      ball.vy = -SPIKE_SPEED * 0.55;
-    } else {                          // flat power spike
-      ball.vx = f * SPIKE_SPEED;
-      ball.vy = SPIKE_SPEED * 0.32;
-    }
-    ball.vx += p.vx * 0.3;            // carry some of Pikachu's momentum
-    clampBallSpeed();
-    ball.x = p.x + f * (BODY_R + BALL_R) * 0.85;
+  // shove the ball just clear of the body so the same contact can't re-fire
+  function pushBallOut(p, dx, dy) {
+    let d = Math.hypot(dx, dy);
+    if (d < 0.5) { dx = 0; dy = -1; d = 1; }       // degenerate (dead centre): push up
+    const need = BALL_R + BODY_R + 1;
+    ball.x = p.x + dx / d * need;
+    ball.y = p.y + dy / d * need;
     settleBallAfterHit(p.x);
-    p.spikePose = 8;
-    shake = Math.max(shake, 4);
-    sfxSpike();
   }
 
-  function normalBump(p) {
-    const cx = p.x, cy = p.y - 2;            // body centre (slightly above mid)
-    let dx = ball.x - cx, dy = ball.y - cy;
-    let dist = Math.hypot(dx, dy) || 0.0001;
-    const nx = dx / dist, ny = dy / dist;
-
-    // reflect incoming velocity about the contact normal
-    const dot = ball.vx * nx + ball.vy * ny;
-    let rvx = ball.vx, rvy = ball.vy;
-    if (dot < 0) { rvx = ball.vx - 2 * dot * nx; rvy = ball.vy - 2 * dot * ny; }
-
-    let sp = clamp(Math.hypot(rvx, rvy) * 0.95, 6, BALL_MAX);
-    // blend reflection with a push straight along the normal so grazes don't die
-    let ox = rvx + nx * sp * 0.6, oy = rvy + ny * sp * 0.6;
-    const om = Math.hypot(ox, oy) || 1;
-    ball.vx = ox / om * sp;
-    ball.vy = oy / om * sp;
-
-    // impart Pikachu momentum + a gentle bias back toward the net + lift
-    ball.vx += p.vx * 0.5 + p.facing * 1.2;
-    ball.vy += p.vy * 0.35 - 1.6;
-
-    if (ny < -0.55) ball.vy -= 3;            // HEAD contact -> extra pop upward
-    if (p.state === 'dive' || p.state === 'lie') {  // sliding receive -> high save
-      ball.vy -= 3.5;
-      ball.vx = p.facing * Math.abs(ball.vx) * 0.7 + p.vx * 0.4;
-    }
-
+  // [1] head / body bump — the launch angle is decided by the hit offset (dx).
+  //     A central "crown" hit goes high and barely forward; a front-of-head hit
+  //     drives forward and flat. The small facing term keeps centred bumps
+  //     progressing over the net so a player under the ball can't self-rally forever.
+  function headBodyBump(p, dx) {
+    ball.vx = dx * HEAD_SPREAD + p.facing * BUMP_FORWARD + p.vx * 0.15;
+    ball.vy = -BUMP_UP + Math.abs(dx) * 0.10;       // central hit pops highest, edge hits flatter
     clampBallSpeed();
-    // push the ball clear of the body so it can't re-trigger next frame
-    const need = BALL_R + BODY_R + 0.5;
-    ball.x = cx + nx * need;
-    ball.y = cy + ny * need;
-    settleBallAfterHit(cx);
     sfxBump();
   }
 
-  function ballPlayerCollision(p, idx) {
+  // [1] feet / leg block while grounded — the ball just drops nearly straight down
+  function feetDribble(p, dx) {
+    ball.vx = dx * 0.08;
+    ball.vy = -2.5;
+    sfxBump();
+  }
+
+  // [2] spike — fixed, huge diagonal-down vector; the incoming velocity is ignored
+  function spikeBall(p) {
+    const f = p.facing;
+    if (p.in.down)    { ball.vx = f * SPIKE_DOWN_VX; ball.vy = SPIKE_DOWN_VY; }  // steep kill
+    else if (p.in.up) { ball.vx = f * SPIKE_FLAT_VX; ball.vy = SPIKE_FLAT_VY; }  // flat fast drive
+    else              { ball.vx = f * SPIKE_VX;      ball.vy = SPIKE_VY; }       // standard slam
+    p.spikePose = 8;
+    shake = Math.max(shake, 5);
+    sfxSpike();
+  }
+
+  // [2] grounded power hit — flat forward drive (a grounded slam would only nosedive)
+  function driveBall(p) {
+    ball.vx = p.facing * DRIVE_VX;
+    ball.vy = DRIVE_VY;
+    p.spikePose = 8;
+    sfxSpike();
+  }
+
+  // [2] sliding receive — fixed, tall, near-vertical set-up vector
+  function slideReceive(p, dx) {
+    ball.vx = dx * 0.18 + p.vx * 0.2;
+    ball.vy = -SLIDE_UP;
+    sfxBump();
+  }
+
+  // detection + routing to the correct hard-coded response
+  function checkCollision(p, idx) {
     if (ball.hitCooldown > 0) return;
-    const cx = p.x, cy = p.y - 2;
-    const dx = ball.x - cx, dy = ball.y - cy;
-    const d = Math.hypot(dx, dy);
-    const extend = p.powerHit ? 13 : (p.state === 'dive' ? 11 : 0);
+    const dx = ball.x - p.x, dy = ball.y - p.y;
+    const extend = p.powerHit ? 14 : (p.state === 'dive' ? 12 : 0);
     const reach = BALL_R + BODY_R + extend;
-    if (d < reach) {
-      if (p.powerHit) spike(p);
-      else normalBump(p);
-      ball.hitCooldown = 4;
-      ball.lastHit = idx;
-    }
+    if (dx * dx + dy * dy > reach * reach) return;
+
+    if (p.state === 'dive' || p.state === 'lie') slideReceive(p, dx);   // sliding receive
+    else if (p.powerHit)                (p.onGround ? driveBall : spikeBall)(p);
+    else if (p.onGround && dy > FEET_DY) feetDribble(p, dx);            // ball at the feet
+    else                                headBodyBump(p, dx);           // head / body
+
+    pushBallOut(p, dx, dy);
+    ball.hitCooldown = 5;
+    ball.lastHit = idx;
   }
 
   // =========================================================================
-  //  NET COLLISION
+  //  NET COLLISION  (perch on the cord, then roll off one side — net in/out)
   // =========================================================================
   function netCollision() {
     const inColumn = ball.x > NET_X - NET_HALF - BALL_R && ball.x < NET_X + NET_HALF + BALL_R;
     if (!inColumn) return;
-    if (ball.y < NET_TOP - BALL_R) return;            // sailing clear over the top
+    if (ball.y + BALL_R < NET_TOP) return;            // sailing clear over the top
 
     if (ball.y < NET_TOP) {
-      // clipped the top cord -> kill momentum, tip up; may drop either side
-      ball.vy = -Math.abs(ball.vy) * 0.55 - 0.8;
-      ball.vx *= 0.6;
-      ball.y = NET_TOP - BALL_R - 0.5;
+      // [3] the ball is sitting on top of the cord
+      if (Math.abs(ball.vx) < NET_ROLL_V) {
+        // slow + perched -> teeter, then roll down whichever side it leans to
+        let side = ball.x < NET_X ? -1 : 1;
+        if (Math.abs(ball.x - NET_X) < 0.6) side = Math.random() < 0.5 ? -1 : 1;  // dead centre: coin flip
+        ball.x = NET_X + side * (NET_HALF + BALL_R + 0.5);   // nudge off-centre, clear of the column
+        ball.vx = side * 1.6;                                // gentle roll-off
+        ball.vy = Math.max(ball.vy * 0.3, 0.6);              // tip over and start dropping
+      } else {
+        // moving fast -> clips the cord, loses height, carries on to its side
+        ball.y = NET_TOP - BALL_R;
+        ball.vy = -Math.abs(ball.vy) * 0.35;
+        ball.vx *= 0.7;
+      }
       sfxNet();
     } else {
-      // hit the side of the net -> bounce back to the side it came from
-      if (ball.x < NET_X) { ball.x = NET_X - NET_HALF - BALL_R; ball.vx = -Math.abs(ball.vx) * 0.8; }
-      else                { ball.x = NET_X + NET_HALF + BALL_R; ball.vx =  Math.abs(ball.vx) * 0.8; }
+      // struck the side of the net below the cord -> rebounds to the near side
+      if (ball.x < NET_X) { ball.x = NET_X - NET_HALF - BALL_R; ball.vx = -Math.abs(ball.vx) * 0.75; }
+      else                { ball.x = NET_X + NET_HALF + BALL_R; ball.vx =  Math.abs(ball.vx) * 0.75; }
       sfxNet();
     }
   }
@@ -521,14 +550,16 @@
   // =========================================================================
   function predictLandingX() {
     let bx = ball.x, by = ball.y, bvx = ball.vx, bvy = ball.vy;
-    for (let i = 0; i < 160; i++) {
-      bvy += GRAVITY_BALL; if (bvy > BALL_MAX) bvy = BALL_MAX;
+    for (let i = 0; i < 220; i++) {
+      bvy += (bvy < 0) ? GRAVITY_UP : GRAVITY_DOWN;
+      if (bvy > BALL_FALL_MAX) bvy = BALL_FALL_MAX;
+      bvx *= AIR_DRAG;
       bx += bvx; by += bvy;
-      if (bx < BALL_R) { bx = BALL_R; bvx = Math.abs(bvx) * 0.9; }
-      if (bx > GAME_W - BALL_R) { bx = GAME_W - BALL_R; bvx = -Math.abs(bvx) * 0.9; }
+      if (bx < BALL_R) { bx = BALL_R; bvx = Math.abs(bvx); }
+      else if (bx > GAME_W - BALL_R) { bx = GAME_W - BALL_R; bvx = -Math.abs(bvx); }
       if (bx > NET_X - NET_HALF - BALL_R && bx < NET_X + NET_HALF + BALL_R && by > NET_TOP) {
-        if (bx < NET_X) { bx = NET_X - NET_HALF - BALL_R; bvx = -Math.abs(bvx) * 0.8; }
-        else            { bx = NET_X + NET_HALF + BALL_R; bvx =  Math.abs(bvx) * 0.8; }
+        if (bx < NET_X) { bx = NET_X - NET_HALF - BALL_R; bvx = -Math.abs(bvx) * 0.75; }
+        else            { bx = NET_X + NET_HALF + BALL_R; bvx =  Math.abs(bvx) * 0.75; }
       }
       if (by >= BALL_GROUND_Y) return bx;
     }
@@ -586,36 +617,44 @@
     if (ball.frozen) { ball.spin += 0.03; return; }
     if (ball.hitCooldown > 0) ball.hitCooldown--;
 
-    ball.vy += GRAVITY_BALL;
-    if (ball.vy > BALL_MAX) ball.vy = BALL_MAX;
-    ball.x += ball.vx;
-    ball.y += ball.vy;
-    ball.spin += ball.vx * 0.045;
+    // [4] asymmetric gravity + featherweight drag -> hang at the apex, fall fast
+    ball.vy += (ball.vy < 0) ? GRAVITY_UP : GRAVITY_DOWN;
+    if (ball.vy > BALL_FALL_MAX) ball.vy = BALL_FALL_MAX;
+    ball.vx *= AIR_DRAG;
 
-    if (ball.x < BALL_R) { ball.x = BALL_R; ball.vx = Math.abs(ball.vx) * 0.92; sfxWall(); }
-    if (ball.x > GAME_W - BALL_R) { ball.x = GAME_W - BALL_R; ball.vx = -Math.abs(ball.vx) * 0.92; sfxWall(); }
+    // Sub-step the integration so a screaming spike can't tunnel through the
+    // thin net or the walls in a single frame.
+    const speed = Math.hypot(ball.vx, ball.vy);
+    const steps = Math.max(1, Math.ceil(speed / (BALL_R * 0.75)));
+    let landed = false;
+    for (let s = 0; s < steps && !landed; s++) {
+      ball.x += ball.vx / steps;
+      ball.y += ball.vy / steps;
 
-    netCollision();
-    // Resolve the closer Pikachu first so a "net joust" (both reaching the
-    // ball on the same frame) is decided by proximity, not array order —
-    // otherwise the left player would always win contested balls.
-    const d0 = Math.hypot(ball.x - players[0].x, ball.y - (players[0].y - 2));
-    const d1 = Math.hypot(ball.x - players[1].x, ball.y - (players[1].y - 2));
-    if (d0 <= d1) { ballPlayerCollision(players[0], 0); ballPlayerCollision(players[1], 1); }
-    else          { ballPlayerCollision(players[1], 1); ballPlayerCollision(players[0], 0); }
+      // [3] walls reflect the angle EXACTLY, with no loss of speed (rally lives)
+      if (ball.x < BALL_R) { ball.x = BALL_R; ball.vx = Math.abs(ball.vx); sfxWall(); }
+      else if (ball.x > GAME_W - BALL_R) { ball.x = GAME_W - BALL_R; ball.vx = -Math.abs(ball.vx); sfxWall(); }
 
-    // safety net: a push-out from a cornered hit must never leave the walls
-    if (ball.x < BALL_R) ball.x = BALL_R;
-    else if (ball.x > GAME_W - BALL_R) ball.x = GAME_W - BALL_R;
+      netCollision();
 
-    if (ball.y >= BALL_GROUND_Y) {
-      ball.y = BALL_GROUND_Y;
+      // Resolve the closer Pikachu first so a "net joust" is decided by
+      // proximity, not array order (otherwise the left player always wins it).
+      const d0 = Math.hypot(ball.x - players[0].x, ball.y - players[0].y);
+      const d1 = Math.hypot(ball.x - players[1].x, ball.y - players[1].y);
+      if (d0 <= d1) { checkCollision(players[0], 0); checkCollision(players[1], 1); }
+      else          { checkCollision(players[1], 1); checkCollision(players[0], 0); }
+
+      if (ball.y >= BALL_GROUND_Y) { ball.y = BALL_GROUND_Y; landed = true; }
+    }
+    ball.spin += ball.vx * 0.05;
+
+    if (landed) {
       if (gameState === 'play') {
         onPointScored();
       } else {
-        ball.vy = -Math.abs(ball.vy) * 0.45;
-        ball.vx *= 0.8;
-        if (Math.abs(ball.vy) < 1.3) { ball.vy = 0; ball.vx *= 0.6; }
+        ball.vy = -Math.abs(ball.vy) * 0.5;        // cosmetic bounce between points
+        ball.vx *= 0.85;
+        if (Math.abs(ball.vy) < 1.4) { ball.vy = 0; ball.vx *= 0.6; }
       }
     }
   }
@@ -1058,7 +1097,7 @@
     text((o1 ? '▶ ' : '   ') + '1 PLAYER  (VS COM)', GAME_W / 2, 150, 13, o1 ? '#fff27a' : '#cdd4ee');
     text((o2 ? '▶ ' : '   ') + '2 PLAYERS', GAME_W / 2, 174, 13, o2 ? '#fff27a' : '#cdd4ee');
 
-    text('1P:  A / D move · W jump · SPACE power', GAME_W / 2, 214, 9, '#bfe6ff');
+    text('1P:  A / D move · W jump · Z / SPACE power', GAME_W / 2, 214, 9, '#bfe6ff');
     text('2P:  ← / → move · ↑ jump · ENTER power', GAME_W / 2, 228, 9, '#bfe6ff');
     text('power in air = SPIKE   ·   power on ground = SLIDE', GAME_W / 2, 244, 9, '#9fb6e6');
 
