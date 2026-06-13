@@ -100,6 +100,12 @@
   const SPIKE_FLAT_VX  = 20, SPIKE_FLAT_VY = 4;    // flat fast drive   (hold UP)
   const DRIVE_VX       = 14, DRIVE_VY      = -2;   // grounded power hit = flat forward drive
   const NET_ROLL_V     = 3.0;     // |vx| below which a ball perches on the cord and rolls off
+  const SPIKE_ARM      = 9;       // frames a power hit stays armed after the press (forgiving timing)
+
+  // --- CPU opponent (tune these for difficulty) ---
+  const AI_ERR         = 6;       // CPU positioning error in px (lower = sharper)
+  const AI_REACT       = 3;       // frames between CPU re-decisions (lower = quicker reactions)
+  const AI_HOME        = NET_X + 84;   // CPU ready/return position on its own side
 
   const POINTS_PER_SET = 15;
   const SETS_TO_WIN    = 2;     // best of 3
@@ -263,6 +269,8 @@
       walkPhase: 0,
       spikePose: 0,
       spiked: false,
+      spikeArmed: 0,
+      driveArmed: 0,
       diveDir: 1,
       lieTimer: 0,
       powerHit: false,
@@ -441,10 +449,16 @@
     const reach = BALL_R + BODY_R + extend;
     if (dx * dx + dy * dy > reach * reach) return;
 
-    if (p.state === 'dive' || p.state === 'lie') slideReceive(p, dx);   // sliding receive
-    else if (p.powerHit)                (p.onGround ? driveBall : spikeBall)(p);
-    else if (p.onGround && dy > FEET_DY) feetDribble(p, dx);            // ball at the feet
-    else                                headBodyBump(p, dx);           // head / body
+    if (p.state === 'dive' || p.state === 'lie') {
+      slideReceive(p, dx);                                  // sliding receive
+    } else if (p.powerHit) {
+      if (p.onGround) { driveBall(p); p.driveArmed = 0; }   // grounded flat drive
+      else { spikeBall(p); p.spiked = true; p.spikeArmed = 0; }  // aerial spike (once per jump)
+    } else if (p.onGround && dy > FEET_DY) {
+      feetDribble(p, dx);                                   // ball at the feet -> dribble down
+    } else {
+      headBodyBump(p, dx);                                  // head / body
+    }
 
     pushBallOut(p, dx, dy);
     ball.hitCooldown = 5;
@@ -505,7 +519,10 @@
 
         if (powerEdge) {
           if (!p.onGround) {
-            if (!p.spiked) { p.powerHit = true; p.spiked = true; p.spikePose = 8; }
+            // arm a SPIKE for a short, forgiving window (once per jump) — it
+            // connects on the first ball contact in that window, so a tap a few
+            // frames before the ball arrives still lands cleanly.
+            if (!p.spiked) { p.spikeArmed = SPIKE_ARM; p.spikePose = 8; }
           } else if (inp.left || inp.right) {
             // sliding dive / receive
             const d = inp.right ? 1 : -1;
@@ -513,11 +530,18 @@
             p.vx = d * DIVE_SPEED; p.vy = -3.2;
             sfxJump();
           } else {
-            p.powerHit = true; p.spikePose = 8;   // standing smash
+            // grounded power = flat forward drive, armed for the same window
+            p.driveArmed = SPIKE_ARM; p.spikePose = 8;
           }
         }
       }
     }
+
+    // The power hit stays "live" for a few frames after the press so timing is
+    // forgiving; checkCollision disarms it the instant it connects.
+    p.powerHit = (p.spikeArmed > 0) || (p.driveArmed > 0);
+    if (p.spikeArmed > 0) p.spikeArmed--;
+    if (p.driveArmed > 0) p.driveArmed--;
 
     if (!p.onGround) p.vy += GRAVITY_PLAYER;
     p.x += p.vx;
@@ -527,6 +551,7 @@
       p.y = GROUND_PLAYER_Y; p.vy = 0;
       if (!p.onGround) {
         p.onGround = true;
+        p.spikeArmed = 0;          // an unused aerial spike doesn't carry into the ground
         if (p.state === 'dive') { p.state = 'lie'; p.lieTimer = DIVE_RECOVER; }
         else if (p.state === 'jump') p.state = Math.abs(p.vx) > 0.1 ? 'walk' : 'idle';
       }
@@ -569,43 +594,56 @@
   function cpuInput(p) {
     const inp = { left: false, right: false, up: false, down: false, power: false };
 
+    // re-plan periodically: where will the ball land, with a little human error?
     if (--p.think <= 0) {
       p.predX = predictLandingX();
-      p.err = rand(-12, 12);
-      p.think = 4;
+      p.err = rand(-AI_ERR, AI_ERR);
+      p.think = AI_REACT;
     }
 
-    const onMySide = ball.x > NET_X || ball.vx > 0.5;
-    const home = GAME_W * 0.72;
-    let target = onMySide
-      ? clamp(p.predX + p.err, NET_X + NET_HALF + PLAYER_HALF_W, GAME_W - PLAYER_HALF_W)
-      : home;
-
-    if (p.x < target - 6) inp.right = true;
-    else if (p.x > target + 6) inp.left = true;
-
+    const onMySide = ball.x > NET_X;
+    const incoming = onMySide || ball.vx > 0;            // ball is on / heading to my side
     const dx = ball.x - p.x;
     const adx = Math.abs(dx);
-    const ballMine = ball.x > NET_X;
 
-    if (ballMine && !ball.frozen) {
-      if (!p.onGround) {
-        // airborne: spike when the ball is in front and within reach
-        if (adx < 34 && ball.y < p.y + 8 && ball.y > p.y - 54) {
-          inp.power = true;
-          if (ball.y < p.y - 18) inp.down = true;     // high ball -> hammer it down
-        }
-      } else {
-        // descending ball overhead -> jump to meet it
-        if (adx < 26 && ball.y < p.y - 8 && ball.vy >= 0 && ball.y > 118) {
+    // stand under the predicted landing spot, else return to a ready position
+    const target = incoming
+      ? clamp(p.predX + p.err, NET_X + NET_HALF + PLAYER_HALF_W, GAME_W - PLAYER_HALF_W)
+      : AI_HOME;
+
+    // A spike only clears the net from the FRONT of the court; from deep it
+    // would nosedive into our own net, so deep balls are safely lofted back
+    // over with a normal contact bump instead.
+    const nearNet = p.x < NET_X + 85;
+    let diving = false;
+    if (onMySide && !ball.frozen) {
+      if (p.onGround) {
+        // attack: jump on a high descending ball, but only near the net
+        if (nearNet && adx < 26 && ball.y < p.y - 30 && ball.y > 96 && ball.vy > -1) {
           inp.up = true;
         }
-        // low fast ball just out of reach -> dive to save
-        else if (ball.y > p.y + 6 && adx > 18 && adx < 58 && ball.vy > 0.5) {
+        // emergency sliding dig for a low ball just off to the side
+        else if (ball.y > p.y - 6 && adx > 20 && adx < 66 && ball.vy > 1.5) {
           inp.power = true;
           if (dx < 0) inp.left = true; else inp.right = true;
+          diving = true;
+        }
+        // otherwise: stand and let the contact bump loft it back over (safe)
+      } else {
+        // airborne: drive it over with a flat, fast spike — but only near the
+        // net so it actually clears. Elsewhere, an airborne contact bump lofts it.
+        const inReach = adx < 40 && ball.y > p.y - 58 && ball.y < p.y + 16;
+        if (inReach && nearNet) {
+          inp.power = true;
+          inp.up = true;     // SPIKE_FLAT: clears the cord and drives deep
         }
       }
+    }
+
+    // move toward the target (never fight a committed dive)
+    if (!diving && p.state !== 'dive' && p.state !== 'lie') {
+      if (p.x < target - 5) inp.right = true;
+      else if (p.x > target + 5) inp.left = true;
     }
     return inp;
   }
