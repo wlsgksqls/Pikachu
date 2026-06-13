@@ -1,0 +1,1158 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>피카츄 배구 · Pikachu Volleyball</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: radial-gradient(circle at 50% 30%, #1b2440 0%, #070912 100%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    font-family: "Courier New", monospace;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none;
+  }
+  #stage {
+    position: relative;
+    line-height: 0;
+  }
+  canvas {
+    /* Internal resolution is 432x304; upscale with nearest-neighbour for crisp retro pixels */
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+    width: min(98vw, calc(98vh * 432 / 304));
+    height: auto;
+    border-radius: 6px;
+    box-shadow: 0 0 0 4px #11131f, 0 0 0 8px #2a2f45, 0 18px 60px rgba(0,0,0,0.75);
+    background: #88d0ff;
+  }
+  #hint {
+    position: absolute;
+    bottom: -26px;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    color: #7d86a8;
+    font-size: 12px;
+    letter-spacing: 1px;
+    line-height: 1.2;
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="game" width="432" height="304"></canvas>
+    <div id="hint">1P: A/D · W · SPACE &nbsp;|&nbsp; 2P: ←/→ · ↑ · ENTER &nbsp;|&nbsp; P: pause · M: mute</div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  // =========================================================================
+  //  CONSTANTS  (world is a fixed 432 x 304 grid, upscaled by CSS)
+  // =========================================================================
+  const GAME_W = 432, GAME_H = 304;
+  const HORIZON = 112;          // top of the sea
+  const SAND_Y  = 200;          // top of the beach/court sand
+  const FLOOR_Y = 272;          // the playing surface (feet / ball rest line)
+
+  const NET_X       = 216;      // net is dead centre
+  const NET_HALF    = 4;        // collision half-thickness
+  const NET_VHALF   = 6;        // visual half-thickness
+  const NET_TOP     = 158;      // top of the net
+
+  const PLAYER_HALF_W = 19;
+  const PLAYER_HALF_H = 20;
+  const GROUND_PLAYER_Y = FLOOR_Y - PLAYER_HALF_H;   // body-centre Y when standing
+  const BODY_R = 18;            // Pikachu collision radius (head+body blob)
+
+  const BALL_R = 12;
+  const BALL_GROUND_Y = FLOOR_Y - BALL_R;
+
+  const GRAVITY_BALL   = 0.40;
+  const GRAVITY_PLAYER = 0.62;
+  const JUMP_V         = -12.6;
+  const MOVE_SPEED     = 4.3;
+  const BALL_MAX       = 16;
+  const SPIKE_SPEED    = 15;
+  const DIVE_SPEED     = 8;
+  const DIVE_RECOVER   = 20;    // frames lying down after a slide
+
+  const POINTS_PER_SET = 15;
+  const SETS_TO_WIN    = 2;     // best of 3
+
+  const SIM_FPS = 60, STEP = 1000 / SIM_FPS;
+
+  // colour palette --------------------------------------------------------
+  const YEL    = '#f6cb2f';
+  const YEL_LT = '#fde06f';
+  const YEL_DK = '#e0a81c';
+  const BLK    = '#2b2b2b';
+  const RED    = '#e23b2e';
+  const BRN    = '#9a5f1d';
+  const OUT    = '#4a3a0c';      // warm dark outline
+  const WHT    = '#ffffff';
+
+  // =========================================================================
+  //  CANVAS
+  // =========================================================================
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+
+  // =========================================================================
+  //  AUDIO  (tiny synthesised retro blips, no external assets)
+  // =========================================================================
+  let audioCtx = null, muted = false;
+  function ensureAudio() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (e) { audioCtx = null; }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  }
+  function blip(freq, dur, type, vol, slideTo) {
+    if (muted || !audioCtx) return;
+    try {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.type = type || 'square';
+      const t = audioCtx.currentTime;
+      o.frequency.setValueAtTime(freq, t);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+      g.gain.setValueAtTime(vol || 0.05, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(t); o.stop(t + dur);
+    } catch (e) {}
+  }
+  const sfxBump  = () => blip(420, 0.07, 'square', 0.05);
+  const sfxSpike = () => blip(880, 0.12, 'sawtooth', 0.06, 180);
+  const sfxJump  = () => blip(560, 0.06, 'square', 0.04, 760);
+  const sfxNet   = () => blip(150, 0.10, 'triangle', 0.06);
+  const sfxWall  = () => blip(300, 0.05, 'square', 0.04);
+  function sfxScore() {
+    blip(660, 0.10, 'square', 0.05);
+    setTimeout(() => blip(880, 0.14, 'square', 0.05), 90);
+  }
+
+  // =========================================================================
+  //  MATH HELPERS
+  // =========================================================================
+  const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+  const rand  = (a, b) => a + Math.random() * (b - a);
+  const TAU = Math.PI * 2;
+
+  // =========================================================================
+  //  STATE
+  // =========================================================================
+  let gameState = 'menu';   // menu | serve | play | point | setover | matchover
+  let mode = 'cpu';         // cpu | 2p
+  let paused = false;
+  let menuSel = 0;          // 0 = vs CPU, 1 = 2 players
+
+  let score = [0, 0];       // [P1(left), P2(right)]
+  let sets  = [0, 0];
+  let lastServer = 0;       // index that serves next
+  let setWinner = 0, matchWinner = 0, pointWinner = 0;
+  let pendingSet = false;
+  let msgTimer = 0, serveTimer = 0;
+  let pointFlashTimer = 0;
+  let shake = 0;            // screen-shake amount
+
+  let gameFrame = 0;        // counts simulation steps
+  let animTime = 0;         // counts rendered frames (for background motion)
+
+  let players = [];
+  const ball = {
+    x: GAME_W / 2, y: 70, vx: 0, vy: 0,
+    spin: 0, frozen: true, hitCooldown: 0, lastHit: -1
+  };
+
+  // =========================================================================
+  //  INPUT
+  // =========================================================================
+  const keys = {};
+
+  function readInput(p) {
+    if (p.isRight) {
+      return {
+        left:  !!keys['ArrowLeft'],
+        right: !!keys['ArrowRight'],
+        up:    !!keys['ArrowUp'],
+        down:  !!keys['ArrowDown'],
+        power: !!keys['Enter'] || !!keys['ShiftRight']
+      };
+    }
+    return {
+      left:  !!keys['KeyA'],
+      right: !!keys['KeyD'],
+      up:    !!keys['KeyW'],
+      down:  !!keys['KeyS'],
+      power: !!keys['Space'] || !!keys['ShiftLeft']
+    };
+  }
+
+  window.addEventListener('keydown', function (e) {
+    ensureAudio();
+    if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].indexOf(e.code) !== -1) {
+      e.preventDefault();
+    }
+    const wasUp = !keys[e.code];
+    keys[e.code] = true;
+    if (!wasUp) return;        // ignore auto-repeat for edge actions
+
+    if (e.code === 'KeyM') muted = !muted;
+
+    if (gameState === 'menu') {
+      if (e.code === 'ArrowUp' || e.code === 'KeyW' || e.code === 'ArrowDown' || e.code === 'KeyS') {
+        menuSel = menuSel === 0 ? 1 : 0;
+      } else if (e.code === 'Enter' || e.code === 'Space') {
+        startMatch(menuSel === 0 ? 'cpu' : '2p');
+      } else if (e.code === 'Digit1') {
+        startMatch('cpu');
+      } else if (e.code === 'Digit2') {
+        startMatch('2p');
+      }
+    } else if (gameState === 'matchover') {
+      if (e.code === 'Enter' || e.code === 'Space') gotoMenu();
+    } else {
+      if (e.code === 'KeyP') paused = !paused;
+      if (e.code === 'Escape') gotoMenu();
+    }
+  });
+
+  window.addEventListener('keyup', function (e) { keys[e.code] = false; });
+  window.addEventListener('blur', function () { for (const k in keys) keys[k] = false; });
+
+  // =========================================================================
+  //  GAME FLOW
+  // =========================================================================
+  function makePlayer(isRight, isCPU) {
+    return {
+      isRight: isRight, isCPU: isCPU,
+      facing: isRight ? -1 : 1,
+      x: isRight ? GAME_W * 0.75 : GAME_W * 0.25,
+      y: GROUND_PLAYER_Y,
+      vx: 0, vy: 0,
+      onGround: true,
+      state: 'idle',      // idle | walk | jump | dive | lie
+      walkPhase: 0,
+      spikePose: 0,
+      spiked: false,
+      diveDir: 1,
+      lieTimer: 0,
+      powerHit: false,
+      prevPower: false,
+      in: { left: false, right: false, up: false, down: false, power: false },
+      // CPU helpers
+      predX: GAME_W * 0.75,
+      err: 0,
+      think: 0
+    };
+  }
+
+  function startMatch(m) {
+    mode = m;
+    score = [0, 0];
+    sets = [0, 0];
+    players = [makePlayer(false, false), makePlayer(true, m === 'cpu')];
+    lastServer = 0;
+    paused = false;
+    startServe(0);
+  }
+
+  function gotoMenu() {
+    gameState = 'menu';
+    paused = false;
+  }
+
+  function resetPositions() {
+    for (const p of players) {
+      p.x = p.isRight ? GAME_W * 0.75 : GAME_W * 0.25;
+      p.y = GROUND_PLAYER_Y;
+      p.vx = 0; p.vy = 0;
+      p.onGround = true;
+      p.state = 'idle';
+      p.spikePose = 0; p.spiked = false; p.lieTimer = 0;
+      p.powerHit = false; p.prevPower = false;
+    }
+  }
+
+  function startServe(idx) {
+    resetPositions();
+    lastServer = idx;
+    ball.x = idx === 0 ? GAME_W * 0.25 : GAME_W * 0.75;
+    ball.y = 64;
+    ball.vx = 0; ball.vy = 0; ball.spin = 0;
+    ball.frozen = true; ball.hitCooldown = 0; ball.lastHit = -1;
+    serveTimer = 30;
+    gameState = 'serve';
+  }
+
+  function onPointScored() {
+    const leftLost = ball.x < NET_X;       // ball hit floor on the left half
+    const scorer = leftLost ? 1 : 0;       // the OTHER side scores
+    score[scorer]++;
+    lastServer = scorer;                   // winner serves next
+    pointWinner = scorer;
+    pointFlashTimer = 70;
+    shake = 6;
+    sfxScore();
+    ball.vy = -Math.abs(ball.vy) * 0.45;   // little cosmetic bounce
+    ball.lastHit = -1;
+
+    if (score[scorer] >= POINTS_PER_SET) {
+      sets[scorer]++;
+      setWinner = scorer;
+      pendingSet = true;
+      gameState = 'setover';
+      msgTimer = 130;
+    } else {
+      gameState = 'point';
+      msgTimer = 80;
+    }
+  }
+
+  function afterMessage() {
+    if (pendingSet) {
+      pendingSet = false;
+      if (sets[setWinner] >= SETS_TO_WIN) {
+        matchWinner = setWinner;
+        gameState = 'matchover';
+        return;
+      }
+      score = [0, 0];
+      startServe(lastServer);
+    } else {
+      startServe(lastServer);
+    }
+  }
+
+  // =========================================================================
+  //  BALL <-> PLAYER COLLISION  (the heart of the physics)
+  //  The contact normal decides the rebound angle, so a hit on the HEAD
+  //  pops the ball up, a hit on the BODY/front drives it sideways, and a
+  //  hit on the BACK/TAIL flicks it back over the player like a set.
+  // =========================================================================
+  function clampBallSpeed() {
+    const s = Math.hypot(ball.vx, ball.vy);
+    if (s > BALL_MAX) { ball.vx = ball.vx / s * BALL_MAX; ball.vy = ball.vy / s * BALL_MAX; }
+  }
+
+  // After a hit repositions the ball, keep it inside the walls and on the
+  // hitter's own side of the net (the ball must travel over, never tunnel).
+  function settleBallAfterHit(cx) {
+    ball.x = clamp(ball.x, BALL_R, GAME_W - BALL_R);
+    if (ball.y + BALL_R > NET_TOP) {
+      if (cx < NET_X) ball.x = Math.min(ball.x, NET_X - NET_HALF - BALL_R);
+      else            ball.x = Math.max(ball.x, NET_X + NET_HALF + BALL_R);
+    }
+  }
+
+  function spike(p) {
+    const f = p.facing;
+    const up = p.in.up, down = p.in.down;
+    if (down) {                       // steep kill straight down
+      ball.vx = f * SPIKE_SPEED * 0.85;
+      ball.vy = SPIKE_SPEED * 0.85;
+    } else if (up) {                  // high deep lob / feint
+      ball.vx = f * SPIKE_SPEED * 0.5;
+      ball.vy = -SPIKE_SPEED * 0.55;
+    } else {                          // flat power spike
+      ball.vx = f * SPIKE_SPEED;
+      ball.vy = SPIKE_SPEED * 0.32;
+    }
+    ball.vx += p.vx * 0.3;            // carry some of Pikachu's momentum
+    clampBallSpeed();
+    ball.x = p.x + f * (BODY_R + BALL_R) * 0.85;
+    settleBallAfterHit(p.x);
+    p.spikePose = 8;
+    shake = Math.max(shake, 4);
+    sfxSpike();
+  }
+
+  function normalBump(p) {
+    const cx = p.x, cy = p.y - 2;            // body centre (slightly above mid)
+    let dx = ball.x - cx, dy = ball.y - cy;
+    let dist = Math.hypot(dx, dy) || 0.0001;
+    const nx = dx / dist, ny = dy / dist;
+
+    // reflect incoming velocity about the contact normal
+    const dot = ball.vx * nx + ball.vy * ny;
+    let rvx = ball.vx, rvy = ball.vy;
+    if (dot < 0) { rvx = ball.vx - 2 * dot * nx; rvy = ball.vy - 2 * dot * ny; }
+
+    let sp = clamp(Math.hypot(rvx, rvy) * 0.95, 6, BALL_MAX);
+    // blend reflection with a push straight along the normal so grazes don't die
+    let ox = rvx + nx * sp * 0.6, oy = rvy + ny * sp * 0.6;
+    const om = Math.hypot(ox, oy) || 1;
+    ball.vx = ox / om * sp;
+    ball.vy = oy / om * sp;
+
+    // impart Pikachu momentum + a gentle bias back toward the net + lift
+    ball.vx += p.vx * 0.5 + p.facing * 1.2;
+    ball.vy += p.vy * 0.35 - 1.6;
+
+    if (ny < -0.55) ball.vy -= 3;            // HEAD contact -> extra pop upward
+    if (p.state === 'dive' || p.state === 'lie') {  // sliding receive -> high save
+      ball.vy -= 3.5;
+      ball.vx = p.facing * Math.abs(ball.vx) * 0.7 + p.vx * 0.4;
+    }
+
+    clampBallSpeed();
+    // push the ball clear of the body so it can't re-trigger next frame
+    const need = BALL_R + BODY_R + 0.5;
+    ball.x = cx + nx * need;
+    ball.y = cy + ny * need;
+    settleBallAfterHit(cx);
+    sfxBump();
+  }
+
+  function ballPlayerCollision(p, idx) {
+    if (ball.hitCooldown > 0) return;
+    const cx = p.x, cy = p.y - 2;
+    const dx = ball.x - cx, dy = ball.y - cy;
+    const d = Math.hypot(dx, dy);
+    const extend = p.powerHit ? 13 : (p.state === 'dive' ? 11 : 0);
+    const reach = BALL_R + BODY_R + extend;
+    if (d < reach) {
+      if (p.powerHit) spike(p);
+      else normalBump(p);
+      ball.hitCooldown = 4;
+      ball.lastHit = idx;
+    }
+  }
+
+  // =========================================================================
+  //  NET COLLISION
+  // =========================================================================
+  function netCollision() {
+    const inColumn = ball.x > NET_X - NET_HALF - BALL_R && ball.x < NET_X + NET_HALF + BALL_R;
+    if (!inColumn) return;
+    if (ball.y < NET_TOP - BALL_R) return;            // sailing clear over the top
+
+    if (ball.y < NET_TOP) {
+      // clipped the top cord -> kill momentum, tip up; may drop either side
+      ball.vy = -Math.abs(ball.vy) * 0.55 - 0.8;
+      ball.vx *= 0.6;
+      ball.y = NET_TOP - BALL_R - 0.5;
+      sfxNet();
+    } else {
+      // hit the side of the net -> bounce back to the side it came from
+      if (ball.x < NET_X) { ball.x = NET_X - NET_HALF - BALL_R; ball.vx = -Math.abs(ball.vx) * 0.8; }
+      else                { ball.x = NET_X + NET_HALF + BALL_R; ball.vx =  Math.abs(ball.vx) * 0.8; }
+      sfxNet();
+    }
+  }
+
+  // =========================================================================
+  //  PLAYER UPDATE
+  // =========================================================================
+  function updatePlayer(p, idx) {
+    p.powerHit = false;
+    const inp = p.isCPU ? cpuInput(p) : readInput(p);
+    p.in = inp;
+    const powerEdge = inp.power && !p.prevPower;
+
+    if (p.state === 'lie') {
+      p.vx *= 0.8;
+      if (--p.lieTimer <= 0) p.state = 'idle';
+    } else {
+      if (p.state !== 'dive') {
+        p.vx = (inp.right ? MOVE_SPEED : 0) - (inp.left ? MOVE_SPEED : 0);
+
+        if (inp.up && p.onGround) {
+          p.vy = JUMP_V; p.onGround = false; p.state = 'jump'; p.spiked = false; sfxJump();
+        }
+
+        if (powerEdge) {
+          if (!p.onGround) {
+            if (!p.spiked) { p.powerHit = true; p.spiked = true; p.spikePose = 8; }
+          } else if (inp.left || inp.right) {
+            // sliding dive / receive
+            const d = inp.right ? 1 : -1;
+            p.state = 'dive'; p.onGround = false; p.diveDir = d;
+            p.vx = d * DIVE_SPEED; p.vy = -3.2;
+            sfxJump();
+          } else {
+            p.powerHit = true; p.spikePose = 8;   // standing smash
+          }
+        }
+      }
+    }
+
+    if (!p.onGround) p.vy += GRAVITY_PLAYER;
+    p.x += p.vx;
+    p.y += p.vy;
+
+    if (p.y >= GROUND_PLAYER_Y) {
+      p.y = GROUND_PLAYER_Y; p.vy = 0;
+      if (!p.onGround) {
+        p.onGround = true;
+        if (p.state === 'dive') { p.state = 'lie'; p.lieTimer = DIVE_RECOVER; }
+        else if (p.state === 'jump') p.state = Math.abs(p.vx) > 0.1 ? 'walk' : 'idle';
+      }
+    }
+    if (p.onGround && p.state !== 'lie' && p.state !== 'dive') {
+      p.state = Math.abs(p.vx) > 0.1 ? 'walk' : 'idle';
+    }
+
+    const minX = p.isRight ? NET_X + NET_HALF + PLAYER_HALF_W : PLAYER_HALF_W;
+    const maxX = p.isRight ? GAME_W - PLAYER_HALF_W : NET_X - NET_HALF - PLAYER_HALF_W;
+    if (p.x < minX) { p.x = minX; if (p.vx < 0) p.vx = 0; }
+    if (p.x > maxX) { p.x = maxX; if (p.vx > 0) p.vx = 0; }
+
+    if (Math.abs(p.vx) > 0.1) p.walkPhase += 0.32;
+    if (p.spikePose > 0) p.spikePose--;
+    p.prevPower = inp.power;
+  }
+
+  // =========================================================================
+  //  CPU AI
+  // =========================================================================
+  function predictLandingX() {
+    let bx = ball.x, by = ball.y, bvx = ball.vx, bvy = ball.vy;
+    for (let i = 0; i < 160; i++) {
+      bvy += GRAVITY_BALL; if (bvy > BALL_MAX) bvy = BALL_MAX;
+      bx += bvx; by += bvy;
+      if (bx < BALL_R) { bx = BALL_R; bvx = Math.abs(bvx) * 0.9; }
+      if (bx > GAME_W - BALL_R) { bx = GAME_W - BALL_R; bvx = -Math.abs(bvx) * 0.9; }
+      if (bx > NET_X - NET_HALF - BALL_R && bx < NET_X + NET_HALF + BALL_R && by > NET_TOP) {
+        if (bx < NET_X) { bx = NET_X - NET_HALF - BALL_R; bvx = -Math.abs(bvx) * 0.8; }
+        else            { bx = NET_X + NET_HALF + BALL_R; bvx =  Math.abs(bvx) * 0.8; }
+      }
+      if (by >= BALL_GROUND_Y) return bx;
+    }
+    return bx;
+  }
+
+  function cpuInput(p) {
+    const inp = { left: false, right: false, up: false, down: false, power: false };
+
+    if (--p.think <= 0) {
+      p.predX = predictLandingX();
+      p.err = rand(-12, 12);
+      p.think = 4;
+    }
+
+    const onMySide = ball.x > NET_X || ball.vx > 0.5;
+    const home = GAME_W * 0.72;
+    let target = onMySide
+      ? clamp(p.predX + p.err, NET_X + NET_HALF + PLAYER_HALF_W, GAME_W - PLAYER_HALF_W)
+      : home;
+
+    if (p.x < target - 6) inp.right = true;
+    else if (p.x > target + 6) inp.left = true;
+
+    const dx = ball.x - p.x;
+    const adx = Math.abs(dx);
+    const ballMine = ball.x > NET_X;
+
+    if (ballMine && !ball.frozen) {
+      if (!p.onGround) {
+        // airborne: spike when the ball is in front and within reach
+        if (adx < 34 && ball.y < p.y + 8 && ball.y > p.y - 54) {
+          inp.power = true;
+          if (ball.y < p.y - 18) inp.down = true;     // high ball -> hammer it down
+        }
+      } else {
+        // descending ball overhead -> jump to meet it
+        if (adx < 26 && ball.y < p.y - 8 && ball.vy >= 0 && ball.y > 118) {
+          inp.up = true;
+        }
+        // low fast ball just out of reach -> dive to save
+        else if (ball.y > p.y + 6 && adx > 18 && adx < 58 && ball.vy > 0.5) {
+          inp.power = true;
+          if (dx < 0) inp.left = true; else inp.right = true;
+        }
+      }
+    }
+    return inp;
+  }
+
+  // =========================================================================
+  //  BALL UPDATE
+  // =========================================================================
+  function updateBall() {
+    if (ball.frozen) { ball.spin += 0.03; return; }
+    if (ball.hitCooldown > 0) ball.hitCooldown--;
+
+    ball.vy += GRAVITY_BALL;
+    if (ball.vy > BALL_MAX) ball.vy = BALL_MAX;
+    ball.x += ball.vx;
+    ball.y += ball.vy;
+    ball.spin += ball.vx * 0.045;
+
+    if (ball.x < BALL_R) { ball.x = BALL_R; ball.vx = Math.abs(ball.vx) * 0.92; sfxWall(); }
+    if (ball.x > GAME_W - BALL_R) { ball.x = GAME_W - BALL_R; ball.vx = -Math.abs(ball.vx) * 0.92; sfxWall(); }
+
+    netCollision();
+    // Resolve the closer Pikachu first so a "net joust" (both reaching the
+    // ball on the same frame) is decided by proximity, not array order —
+    // otherwise the left player would always win contested balls.
+    const d0 = Math.hypot(ball.x - players[0].x, ball.y - (players[0].y - 2));
+    const d1 = Math.hypot(ball.x - players[1].x, ball.y - (players[1].y - 2));
+    if (d0 <= d1) { ballPlayerCollision(players[0], 0); ballPlayerCollision(players[1], 1); }
+    else          { ballPlayerCollision(players[1], 1); ballPlayerCollision(players[0], 0); }
+
+    // safety net: a push-out from a cornered hit must never leave the walls
+    if (ball.x < BALL_R) ball.x = BALL_R;
+    else if (ball.x > GAME_W - BALL_R) ball.x = GAME_W - BALL_R;
+
+    if (ball.y >= BALL_GROUND_Y) {
+      ball.y = BALL_GROUND_Y;
+      if (gameState === 'play') {
+        onPointScored();
+      } else {
+        ball.vy = -Math.abs(ball.vy) * 0.45;
+        ball.vx *= 0.8;
+        if (Math.abs(ball.vy) < 1.3) { ball.vy = 0; ball.vx *= 0.6; }
+      }
+    }
+  }
+
+  // =========================================================================
+  //  MAIN UPDATE
+  // =========================================================================
+  function updatePlayers() {
+    for (let i = 0; i < players.length; i++) updatePlayer(players[i], i);
+  }
+
+  function update() {
+    if (shake > 0) shake *= 0.86;
+    if (pointFlashTimer > 0) pointFlashTimer--;
+
+    switch (gameState) {
+      case 'serve':
+        updatePlayers();
+        if (serveTimer > 0 && --serveTimer === 0) { ball.frozen = false; gameState = 'play'; }
+        updateBall();
+        break;
+      case 'play':
+        updatePlayers();
+        updateBall();
+        break;
+      case 'point':
+      case 'setover':
+        updatePlayers();
+        updateBall();
+        if (msgTimer > 0 && --msgTimer === 0) afterMessage();
+        break;
+      default: break;   // menu / matchover idle
+    }
+  }
+
+  // =========================================================================
+  //  RENDER HELPERS
+  // =========================================================================
+  function fillCircle(x, y, r, color) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fillStyle = color; ctx.fill();
+  }
+  function fillEllipse(cx, cy, rx, ry, color, rot) {
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, rot || 0, 0, TAU);
+    ctx.fillStyle = color; ctx.fill();
+  }
+  function outlineEllipse(cx, cy, rx, ry) {
+    ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, TAU);
+    ctx.lineWidth = 1.5; ctx.strokeStyle = OUT; ctx.stroke();
+  }
+  function text(str, x, y, size, color, align, baseline, outline) {
+    ctx.font = 'bold ' + size + 'px "Courier New", monospace';
+    ctx.textAlign = align || 'center';
+    ctx.textBaseline = baseline || 'middle';
+    if (outline !== false) {
+      ctx.lineWidth = Math.max(2, size * 0.18);
+      ctx.strokeStyle = 'rgba(20,22,34,0.92)';
+      ctx.lineJoin = 'round';
+      ctx.strokeText(str, x, y);
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(str, x, y);
+  }
+
+  // =========================================================================
+  //  BACKGROUND
+  // =========================================================================
+  function drawCloud(x, y, s) {
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    fillCircle(x, y, 8 * s);
+    fillCircle(x + 9 * s, y + 2 * s, 10 * s);
+    fillCircle(x + 20 * s, y, 7 * s);
+    fillCircle(x + 10 * s, y - 5 * s, 8 * s);
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fillRect(x - 2, y, 24 * s, 7 * s);
+  }
+
+  function drawBackground() {
+    // sky
+    const sky = ctx.createLinearGradient(0, 0, 0, HORIZON);
+    sky.addColorStop(0, '#4fb3ff');
+    sky.addColorStop(1, '#bdeaff');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, GAME_W, HORIZON);
+
+    // sun
+    ctx.fillStyle = 'rgba(255,247,200,0.85)'; fillCircle(360, 54, 26);
+    ctx.fillStyle = '#ffe66e'; fillCircle(360, 54, 17);
+
+    // drifting clouds
+    const drift = (animTime * 0.15);
+    drawCloud(((60 + drift) % (GAME_W + 60)) - 30, 34, 1.0);
+    drawCloud(((200 + drift) % (GAME_W + 60)) - 30, 22, 0.8);
+    drawCloud(((320 + drift * 0.6) % (GAME_W + 60)) - 30, 64, 1.1);
+
+    // sea
+    const sea = ctx.createLinearGradient(0, HORIZON, 0, SAND_Y);
+    sea.addColorStop(0, '#2f86df');
+    sea.addColorStop(1, '#1857a8');
+    ctx.fillStyle = sea;
+    ctx.fillRect(0, HORIZON, GAME_W, SAND_Y - HORIZON);
+
+    // wave glints
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 5; i++) {
+      const wy = HORIZON + 10 + i * 16;
+      ctx.beginPath();
+      for (let x = 0; x <= GAME_W; x += 8) {
+        const yy = wy + Math.sin((x * 0.08) + animTime * 0.05 + i) * 1.5;
+        if (x === 0) ctx.moveTo(x, yy); else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+    }
+
+    // beach sand
+    const sand = ctx.createLinearGradient(0, SAND_Y, 0, GAME_H);
+    sand.addColorStop(0, '#f0e0aa');
+    sand.addColorStop(1, '#d9c184');
+    ctx.fillStyle = sand;
+    ctx.fillRect(0, SAND_Y, GAME_W, GAME_H - SAND_Y);
+
+    // a shoreline ribbon
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillRect(0, SAND_Y - 2, GAME_W, 3);
+
+    // sand speckle texture (static-ish)
+    ctx.fillStyle = 'rgba(180,150,90,0.35)';
+    for (let i = 0; i < 70; i++) {
+      const sx = (i * 97 % GAME_W);
+      const sy = SAND_Y + 6 + (i * 53 % (GAME_H - SAND_Y - 6));
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+
+    // court baseline marking
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(0, FLOOR_Y, GAME_W, 2);
+  }
+
+  // =========================================================================
+  //  NET  (grid mesh + posts + cord cap)
+  // =========================================================================
+  function drawNet() {
+    const x0 = NET_X - NET_VHALF, x1 = NET_X + NET_VHALF;
+
+    // shadow on the sand
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.fillRect(x1, FLOOR_Y, 10, 3);
+
+    // mesh background
+    ctx.fillStyle = 'rgba(220,235,250,0.12)';
+    ctx.fillRect(x0, NET_TOP, x1 - x0, FLOOR_Y - NET_TOP);
+
+    // grid (격자무늬)
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let gx = x0; gx <= x1; gx += 4) { ctx.moveTo(gx + 0.5, NET_TOP + 4); ctx.lineTo(gx + 0.5, FLOOR_Y); }
+    for (let gy = NET_TOP + 4; gy <= FLOOR_Y; gy += 6) { ctx.moveTo(x0, gy + 0.5); ctx.lineTo(x1, gy + 0.5); }
+    ctx.stroke();
+
+    // side borders
+    ctx.strokeStyle = 'rgba(235,235,235,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0 + 0.5, NET_TOP + 0.5, (x1 - x0) - 1, FLOOR_Y - NET_TOP - 1);
+
+    // white top cord band
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(x0 - 1, NET_TOP, (x1 - x0) + 2, 4);
+    ctx.fillStyle = '#c9c9c9';
+    ctx.fillRect(x0 - 1, NET_TOP + 3, (x1 - x0) + 2, 1);
+
+    // dark cap knob on top
+    ctx.fillStyle = '#3a3a44';
+    fillCircle(NET_X, NET_TOP - 1, 3.2);
+  }
+
+  // =========================================================================
+  //  PIKACHU
+  // =========================================================================
+  function drawEar(bx, by, tx, ty, w) {
+    const ang = Math.atan2(ty - by, tx - bx);
+    const px = Math.cos(ang + Math.PI / 2), py = Math.sin(ang + Math.PI / 2);
+    const tw = w * 0.55;
+    const b1x = bx + px * w, b1y = by + py * w, b2x = bx - px * w, b2y = by - py * w;
+    const t1x = tx + px * tw, t1y = ty + py * tw, t2x = tx - px * tw, t2y = ty - py * tw;
+
+    // yellow body of ear
+    ctx.beginPath();
+    ctx.moveTo(b1x, b1y); ctx.lineTo(t1x, t1y); ctx.lineTo(t2x, t2y); ctx.lineTo(b2x, b2y); ctx.closePath();
+    ctx.fillStyle = YEL; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = OUT; ctx.stroke();
+
+    // black tip (signature)
+    const mx = bx + (tx - bx) * 0.56, my = by + (ty - by) * 0.56;
+    const m1x = mx + px * w * 0.75, m1y = my + py * w * 0.75, m2x = mx - px * w * 0.75, m2y = my - py * w * 0.75;
+    ctx.beginPath();
+    ctx.moveTo(m1x, m1y); ctx.lineTo(t1x, t1y); ctx.lineTo(t2x, t2y); ctx.lineTo(m2x, m2y); ctx.closePath();
+    ctx.fillStyle = BLK; ctx.fill(); ctx.stroke();
+  }
+
+  function drawTail() {
+    // lightning-bolt tail at the back (local -x), with brown base
+    const pts = [
+      [-13, 12], [-23, 13], [-16, 4], [-29, 1], [-19, -6],
+      [-32, -12], [-20, -15], [-26, -28], [-15, -19], [-11, -1]
+    ];
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.closePath();
+    ctx.fillStyle = YEL; ctx.fill();
+    ctx.lineWidth = 1.5; ctx.strokeStyle = OUT; ctx.stroke();
+
+    // brown base patch
+    ctx.beginPath();
+    ctx.moveTo(-13, 12); ctx.lineTo(-23, 13); ctx.lineTo(-16, 4); ctx.lineTo(-11, 6);
+    ctx.closePath();
+    ctx.fillStyle = BRN; ctx.fill(); ctx.stroke();
+  }
+
+  function drawPikachuBody(p) {
+    const walk = p.walkPhase;
+    const spiking = p.spikePose > 0;
+    const diving = (p.state === 'dive' || p.state === 'lie');
+
+    // limb poses
+    let legF = { x: 6, y: 18 }, legB = { x: -6, y: 18 };
+    let armF = { x: 14, y: 6 }, armB = { x: -12, y: 6 };
+    let earLean = 0, mouthOpen = false;
+
+    if (p.state === 'walk') {
+      legF.x = 6 + Math.sin(walk) * 4;
+      legB.x = -6 + Math.sin(walk + Math.PI) * 4;
+    } else if (p.state === 'jump') {
+      legF = { x: 9, y: 13 }; legB = { x: -7, y: 14 };
+      earLean = 0.35;
+    }
+    if (spiking) { armF = { x: 19, y: -15 }; mouthOpen = true; earLean = 0.5; }
+    if (diving) {
+      legF = { x: -8, y: 9 }; legB = { x: -14, y: 12 };
+      armF = { x: 17, y: -3 }; armB = { x: 2, y: 8 };
+      earLean = 0.7; mouthOpen = true;
+    }
+
+    // ---- tail (behind) ----
+    drawTail();
+
+    // ---- back leg ----
+    fillEllipse(legB.x, legB.y, 5, 3.6, YEL_DK); outlineEllipse(legB.x, legB.y, 5, 3.6);
+    // ---- back arm ----
+    fillEllipse(armB.x, armB.y, 4, 4, YEL_DK); outlineEllipse(armB.x, armB.y, 4, 4);
+
+    // ---- ears ----
+    const eb = earLean;
+    drawEar(0, -14, 3 - eb * 12, -45, 4.5);     // back ear
+    drawEar(8, -13, 15 - eb * 10, -43, 4.5);    // front ear
+
+    // ---- body ----
+    fillEllipse(0, 0, 17, 18, YEL);
+    outlineEllipse(0, 0, 17, 18);
+    // lighter belly
+    fillEllipse(4, 6, 11, 10, YEL_LT);
+    // brown back stripes (upper back = -x)
+    ctx.fillStyle = BRN;
+    ctx.fillRect(-11, -9, 9, 3);
+    ctx.fillRect(-12, -3, 10, 3);
+
+    // ---- front leg ----
+    fillEllipse(legF.x, legF.y, 5.2, 3.8, YEL); outlineEllipse(legF.x, legF.y, 5.2, 3.8);
+
+    // ---- face ----
+    // cheeks (red 연지곤지)
+    fillCircle(13, 3, 4.2, RED);
+    fillCircle(2, 4, 3.0, RED);
+    // eyes
+    fillEllipse(11, -7, 2.7, 3.2, BLK);
+    fillEllipse(2, -7, 2.4, 3.0, BLK);
+    ctx.fillStyle = WHT;
+    fillCircle(12, -8, 1.0, WHT);
+    fillCircle(3, -8, 0.9, WHT);
+    // nose
+    ctx.fillStyle = BLK;
+    fillCircle(16, -1, 0.9, BLK);
+    // mouth
+    if (mouthOpen) {
+      fillEllipse(14, 4, 3.2, 2.6, '#7a1f1a');
+      fillEllipse(14, 5, 2.0, 1.3, RED);
+    } else {
+      ctx.strokeStyle = OUT; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(11, 2); ctx.quadraticCurveTo(14, 5, 17, 2); ctx.stroke();
+    }
+
+    // ---- front arm / paw ----
+    fillEllipse(armF.x, armF.y, 4.2, 4.2, YEL); outlineEllipse(armF.x, armF.y, 4.2, 4.2);
+
+    // dizzy stars when lying down
+    if (p.state === 'lie') {
+      ctx.fillStyle = '#fff27a';
+      const a = animTime * 0.2;
+      for (let i = 0; i < 3; i++) {
+        const sa = a + i * TAU / 3;
+        text('+', Math.cos(sa) * 9, -28 + Math.sin(sa) * 3, 7, '#fff27a', 'center', 'middle', false);
+      }
+    }
+  }
+
+  function drawPikachu(p) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    if (p.isRight) ctx.scale(-1, 1);   // mirror so default art (faces right) faces the net
+    let rot = 0;
+    if (p.state === 'dive') rot = -0.85;
+    else if (p.state === 'lie') rot = -1.45;
+    if (rot) ctx.rotate(rot);
+    drawPikachuBody(p);
+    ctx.restore();
+  }
+
+  // =========================================================================
+  //  MONSTER BALL  (rotating Poké Ball)
+  // =========================================================================
+  function drawBall() {
+    ctx.save();
+    ctx.translate(ball.x, ball.y);
+    ctx.rotate(ball.spin);
+    const r = BALL_R;
+
+    // white base
+    fillCircle(0, 0, r, '#f2f2f2');
+    // red top half
+    ctx.save();
+    ctx.beginPath(); ctx.rect(-r - 1, -r - 1, (r + 1) * 2, r + 1); ctx.clip();
+    fillCircle(0, 0, r, '#e8403a');
+    // shading band on red
+    ctx.beginPath(); ctx.rect(-r - 1, -r - 1, (r + 1) * 2, r * 0.35); ctx.clip();
+    fillCircle(0, 0, r, '#f2675f');
+    ctx.restore();
+
+    // equator
+    ctx.fillStyle = '#222'; ctx.fillRect(-r, -2, r * 2, 4);
+    // outline
+    ctx.lineWidth = 1.6; ctx.strokeStyle = '#1c1c1c';
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.stroke();
+    // centre button
+    fillCircle(0, 0, 3.4, '#222');
+    fillCircle(0, 0, 2.4, '#f2f2f2');
+    fillCircle(0, 0, 1.1, '#cfcfcf');
+    // glossy highlight (counter-rotates so it reads as a fixed light)
+    ctx.rotate(-ball.spin);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    fillCircle(-r * 0.4, -r * 0.45, r * 0.28, 'rgba(255,255,255,0.35)');
+    ctx.restore();
+  }
+
+  // =========================================================================
+  //  SHADOWS
+  // =========================================================================
+  function drawShadow(x, footY, baseW) {
+    const h = clamp((FLOOR_Y - footY) / 160, 0, 1);   // 0 = on the ground, 1 = high up
+    const w = baseW * (1 - h * 0.55);
+    fillEllipse(x, FLOOR_Y + 3, w, w * 0.32, 'rgba(35,28,10,' + (0.3 * (1 - h * 0.55)) + ')');
+  }
+
+  // =========================================================================
+  //  SCOREBOARD + UI
+  // =========================================================================
+  function drawScoreboard() {
+    const cx = GAME_W / 2;
+    // panel
+    ctx.fillStyle = 'rgba(20,24,40,0.78)';
+    roundRect(cx - 74, 6, 148, 30, 6); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1; ctx.stroke();
+
+    const p1n = '1P';
+    const p2n = mode === 'cpu' ? 'COM' : '2P';
+    text(p1n, cx - 56, 16, 9, '#ffe66e');
+    text(p2n, cx + 56, 16, 9, '#9fe0ff');
+
+    text(String(score[0]), cx - 28, 22, 20, '#ffffff');
+    text(':', cx, 22, 16, '#cfd6ee');
+    text(String(score[1]), cx + 28, 22, 20, '#ffffff');
+
+    // set pips (best of 3)
+    for (let i = 0; i < SETS_TO_WIN; i++) {
+      drawPip(cx - 64 + i * 9, 30, sets[0] > i, '#ffe66e');
+      drawPip(cx + 56 + i * 9, 30, sets[1] > i, '#9fe0ff');
+    }
+
+    // serve indicator
+    if (gameState === 'serve') {
+      const sx = lastServer === 0 ? cx - 40 : cx + 40;
+      text('SERVE', sx, 44, 7, '#ffffff');
+    }
+
+    if (muted) text('MUTED', 4, 15, 8, '#ffd0d0', 'left');
+  }
+
+  function drawPip(x, y, filled, color) {
+    ctx.beginPath(); ctx.arc(x, y, 2.6, 0, TAU);
+    if (filled) { ctx.fillStyle = color; ctx.fill(); }
+    ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.stroke();
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  // mini decorative Pikachu face for the title
+  function drawTitleFace(x, y, s) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+    fillCircle(0, 0, 16, YEL); outlineEllipse(0, 0, 16, 16);
+    drawEar(-7, -12, -12, -34, 4); drawEar(7, -12, 12, -34, 4);
+    fillCircle(-9, 2, 3.6, RED); fillCircle(9, 2, 3.6, RED);
+    fillEllipse(-6, -4, 2.4, 3, BLK); fillEllipse(6, -4, 2.4, 3, BLK);
+    ctx.fillStyle = WHT; fillCircle(-5, -5, 1, WHT); fillCircle(7, -5, 1, WHT);
+    ctx.fillStyle = BLK; fillCircle(0, 1, 1, BLK);
+    ctx.strokeStyle = OUT; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(-4, 4); ctx.quadraticCurveTo(0, 8, 4, 4); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawMenu() {
+    // animated title bob
+    const bob = Math.sin(animTime * 0.05) * 3;
+    drawTitleFace(GAME_W / 2 - 96, 86 + bob, 1.4);
+    drawTitleFace(GAME_W / 2 + 96, 86 - bob, 1.4);
+
+    text('피카츄 배구', GAME_W / 2, 70, 30, '#ffe24a');
+    text('PIKACHU VOLLEYBALL', GAME_W / 2, 100, 15, '#ffffff');
+
+    // options
+    const o1 = menuSel === 0;
+    const o2 = menuSel === 1;
+    text((o1 ? '▶ ' : '   ') + '1 PLAYER  (VS COM)', GAME_W / 2, 150, 13, o1 ? '#fff27a' : '#cdd4ee');
+    text((o2 ? '▶ ' : '   ') + '2 PLAYERS', GAME_W / 2, 174, 13, o2 ? '#fff27a' : '#cdd4ee');
+
+    text('1P:  A / D move · W jump · SPACE power', GAME_W / 2, 214, 9, '#bfe6ff');
+    text('2P:  ← / → move · ↑ jump · ENTER power', GAME_W / 2, 228, 9, '#bfe6ff');
+    text('power in air = SPIKE   ·   power on ground = SLIDE', GAME_W / 2, 244, 9, '#9fb6e6');
+
+    const blink = (animTime % 60) < 38;
+    if (blink) text('PRESS ENTER TO START', GAME_W / 2, 272, 12, '#ffffff');
+  }
+
+  function drawMessages() {
+    if (gameState === 'point' && pointFlashTimer > 0) {
+      const who = pointWinner === 0 ? '1P' : (mode === 'cpu' ? 'COM' : '2P');
+      banner(who + '  POINT!', '#ffe66e');
+    } else if (gameState === 'setover') {
+      const who = setWinner === 0 ? '1P' : (mode === 'cpu' ? 'COM' : '2P');
+      banner('SET ' + (sets[0] + sets[1]) + '  →  ' + who, '#9fe0ff');
+    } else if (gameState === 'matchover') {
+      ctx.fillStyle = 'rgba(10,12,24,0.62)';
+      ctx.fillRect(0, 0, GAME_W, GAME_H);
+      const who = matchWinner === 0 ? '1P' : (mode === 'cpu' ? 'COM' : '2P');
+      text('GAME SET!', GAME_W / 2, 116, 30, '#ffe24a');
+      text(who + ' WINS THE MATCH', GAME_W / 2, 150, 16, '#ffffff');
+      text('FINAL SETS  ' + sets[0] + ' - ' + sets[1], GAME_W / 2, 176, 12, '#cdd4ee');
+      const blink = (animTime % 60) < 38;
+      if (blink) text('PRESS ENTER FOR MENU', GAME_W / 2, 220, 12, '#ffffff');
+    }
+
+    if (paused && (gameState === 'play' || gameState === 'serve')) {
+      ctx.fillStyle = 'rgba(10,12,24,0.55)';
+      ctx.fillRect(0, 0, GAME_W, GAME_H);
+      text('PAUSED', GAME_W / 2, GAME_H / 2 - 6, 26, '#ffffff');
+      text('press P to resume · ESC for menu', GAME_W / 2, GAME_H / 2 + 22, 10, '#cdd4ee');
+    }
+  }
+
+  function banner(str, color) {
+    ctx.fillStyle = 'rgba(20,24,40,0.7)';
+    roundRect(GAME_W / 2 - 110, 118, 220, 34, 8); ctx.fill();
+    text(str, GAME_W / 2, 135, 20, color);
+  }
+
+  // =========================================================================
+  //  RENDER
+  // =========================================================================
+  function render() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, GAME_W, GAME_H);
+
+    // screen shake
+    if (shake > 0.4) {
+      ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    }
+
+    drawBackground();
+
+    if (gameState === 'menu') {
+      drawNet();
+      drawMenu();
+      return;
+    }
+
+    // shadows first
+    for (const p of players) drawShadow(p.x, p.y + PLAYER_HALF_H, 17);
+    drawShadow(ball.x, ball.y + BALL_R, 12);
+
+    drawNet();
+
+    for (const p of players) drawPikachu(p);
+    drawBall();
+
+    drawScoreboard();
+    drawMessages();
+  }
+
+  // =========================================================================
+  //  MAIN LOOP  (fixed-timestep simulation)
+  // =========================================================================
+  let last = performance.now(), acc = 0;
+  function frame(now) {
+    let dt = now - last; last = now;
+    if (dt > 250) dt = 250;
+    acc += dt;
+    let steps = 0;
+    while (acc >= STEP && steps < 5) {
+      if (!paused) { update(); gameFrame++; }
+      acc -= STEP;
+      steps++;
+    }
+    if (paused) acc = 0;
+    animTime++;
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
